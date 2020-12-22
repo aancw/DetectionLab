@@ -1,18 +1,23 @@
-#! /bin/bash
+#! /usr/bin/env bash
 
-# Override existing DNS Settings using netplan, but don't do it for Terraform builds
+# This is the script that is used to provision the logger host
+
+# Override existing DNS Settings using netplan, but don't do it for Terraform AWS builds
 if ! curl -s 169.254.169.254 --connect-timeout 2 >/dev/null; then
   echo -e "    eth1:\n      dhcp4: true\n      nameservers:\n        addresses: [8.8.8.8,8.8.4.4]" >>/etc/netplan/01-netcfg.yaml
   netplan apply
 fi
 sed -i 's/nameserver 127.0.0.53/nameserver 8.8.8.8/g' /etc/resolv.conf && chattr +i /etc/resolv.conf
 
-# Get a free Maxmind license here: https://www.maxmind.com/en/geolite2/signup
-# Required for the ASNgen app to work: https://splunkbase.splunk.com/app/3531/
-export MAXMIND_LICENSE=
-if [ -n "$MAXMIND_LICENSE" ]; then
-  echo "Note: You have not entered a MaxMind license key on line 5 of bootstrap.sh, so the ASNgen Splunk app may not work correctly."
-  echo "However, it is not required and everything else should function correctly."
+# Source variables from logger_variables.sh
+# shellcheck disable=SC1091
+source /vagrant/logger_variables.sh 2>/dev/null || \
+source /home/vagrant/logger_variables.sh 2>/dev/null || \
+echo "Unable to locate logger_variables.sh"
+
+if [ -z "$MAXMIND_LICENSE" ]; then
+  echo "Note: You have not entered a MaxMind API key in logger_variables.sh, so the ASNgen Splunk app may not work correctly."
+  echo "However, it is optional and everything else should function correctly."
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -165,12 +170,22 @@ install_splunk() {
     /opt/splunk/bin/splunk install app /vagrant/resources/splunk_server/sankey-diagram-custom-visualization_130.tgz -auth 'admin:changeme'
     /opt/splunk/bin/splunk install app /vagrant/resources/splunk_server/link-analysis-app-for-splunk_161.tgz -auth 'admin:changeme'
     /opt/splunk/bin/splunk install app /vagrant/resources/splunk_server/threathunting_144.tgz -auth 'admin:changeme'
+    
+    # Fix ASNGen App - https://github.com/doksu/TA-asngen/issues/18#issuecomment-685691630
+    echo 'python.version = python2' >> /opt/splunk/etc/apps/TA-asngen/default/commands.conf
 
-    # Install the Maxmind license key for the ASNgen App
+    # Install the Maxmind license key for the ASNgen App if it was provided
     if [ -n "$MAXMIND_LICENSE" ]; then
       mkdir /opt/splunk/etc/apps/TA-asngen/local
       cp /opt/splunk/etc/apps/TA-asngen/default/asngen.conf /opt/splunk/etc/apps/TA-asngen/local/asngen.conf
       sed -i "s/license_key =/license_key = $MAXMIND_LICENSE/g" /opt/splunk/etc/apps/TA-asngen/local/asngen.conf
+    fi
+
+    # Install a Splunk license if it was provided
+    if [ -n "$BASE64_ENCODED_SPLUNK_LICENSE" ]; then
+      echo "$BASE64_ENCODED_SPLUNK_LICENSE" | base64 -d > /tmp/Splunk.License
+      /opt/splunk/bin/splunk add licenses /tmp/Splunk.License -auth 'admin:changeme'
+      rm /tmp/Splunk.License
     fi
 
     # Replace the props.conf for Sysmon TA and Windows TA
@@ -244,7 +259,7 @@ install_fleet_import_osquery_config() {
     cd /opt || exit 1
 
     echo "[$(date +%H:%M:%S)]: Installing Fleet..."
-    echo -e "\n127.0.0.1       kolide" >>/etc/hosts
+    echo -e "\n127.0.0.1       fleet" >>/etc/hosts
     echo -e "\n127.0.0.1       logger" >>/etc/hosts
 
     # Set MySQL username and password, create kolide database
@@ -252,7 +267,7 @@ install_fleet_import_osquery_config() {
     mysql -uroot -pkolide -e "create database kolide;"
 
     # Always download the latest release of Fleet
-    curl -s https://api.github.com/repos/kolide/fleet/releases/latest | grep 'https://github.com' | grep "/fleet.zip" | cut -d ':' -f 2,3 | tr -d '"' | wget --progress=bar:force -i -
+    curl -s https://api.github.com/repos/fleetdm/fleet/releases/latest | grep 'https://github.com' | grep "/fleet.zip" | cut -d ':' -f 2,3 | tr -d '"' | wget --progress=bar:force -i -
     unzip fleet.zip -d fleet
     cp fleet/linux/fleetctl /usr/local/bin/fleetctl && chmod +x /usr/local/bin/fleetctl
     cp fleet/linux/fleet /usr/local/bin/fleet && chmod +x /usr/local/bin/fleet
@@ -298,8 +313,6 @@ install_fleet_import_osquery_config() {
     fleetctl get options >/tmp/options.yaml
     /usr/bin/yq w -i /tmp/options.yaml 'spec.config.options.enroll_secret' 'enrollmentsecret'
     /usr/bin/yq w -i /tmp/options.yaml 'spec.config.options.logger_snapshot_event_type' 'true'
-    # Fleet 3.0 requires the "kind" to be "options" instead of "option"
-    sed -i 's/kind: option/kind: options/g' /tmp/options.yaml
     fleetctl apply -f /tmp/options.yaml
 
     # Use fleetctl to import YAML files
@@ -313,8 +326,8 @@ install_fleet_import_osquery_config() {
     # Files must exist before splunk will add a monitor
     touch /var/log/fleet/osquery_result
     touch /var/log/fleet/osquery_status
-    /opt/splunk/bin/splunk add monitor "/var/log/fleet/osquery_result" -index osquery -sourcetype 'osquery:json' -auth 'admin:changeme'
-    /opt/splunk/bin/splunk add monitor "/var/log/fleet/osquery_status" -index osquery-status -sourcetype 'osquery:status' -auth 'admin:changeme'
+    /opt/splunk/bin/splunk add monitor "/var/log/fleet/osquery_result" -index osquery -sourcetype 'osquery:json' -auth 'admin:changeme' --accept-license --answer-yes --no-prompt
+    /opt/splunk/bin/splunk add monitor "/var/log/fleet/osquery_status" -index osquery-status -sourcetype 'osquery:status' -auth 'admin:changeme' --accept-license --answer-yes --no-prompt
   fi
 }
 
